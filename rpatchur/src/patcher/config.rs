@@ -14,6 +14,27 @@ pub struct PatcherConfiguration {
     pub web: WebConfiguration,
     pub client: ClientConfiguration,
     pub patching: PatchingConfiguration,
+    #[serde(default)]
+    pub optional_packs: Vec<OptionalPack>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct OptionalPack {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub default_enabled: bool,
+    pub files: Vec<OptionalPackFile>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct OptionalPackFile {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Deserialize, Clone)]

@@ -27,9 +27,9 @@ pub fn process_incoming_commands(
 ) -> InterruptibleFnResult<()> {
     match patching_thread_rx.try_recv() {
         Ok(cmd) => match cmd {
-            PatcherCommand::CancelUpdate | PatcherCommand::Quit => {
-                Err(InterruptibleFnError::Interrupted)
-            }
+            PatcherCommand::CancelUpdate
+            | PatcherCommand::CancelPackDownload
+            | PatcherCommand::Quit => Err(InterruptibleFnError::Interrupted),
             _ => Ok(()),
         },
         Err(e) => match e {

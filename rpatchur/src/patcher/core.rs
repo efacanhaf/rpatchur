@@ -60,6 +60,9 @@ pub async fn patcher_thread_routine(
                 PatcherCommand::ApplyPatch(patch_file_path) => {
                     apply_single_patch(patch_file_path, &ui_controller, config);
                 }
+                PatcherCommand::DownloadPack(pack_id) => {
+                    run_optional_pack_download(&pack_id, &ui_controller, config, rx).await;
+                }
                 _ => {}
             },
         }
@@ -156,6 +159,120 @@ fn apply_single_patch(
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Runs the download for an optional content pack, relaying progress to the UI
+/// and listening for cancellation commands on the patching channel.
+async fn run_optional_pack_download(
+    pack_id: &str,
+    ui_controller: &UiController,
+    config: &PatcherConfiguration,
+    patcher_thread_rx: &mut flume::Receiver<PatcherCommand>,
+) {
+    let pack = match config
+        .optional_packs
+        .iter()
+        .find(|p| p.id == pack_id)
+        .cloned()
+    {
+        Some(p) => p,
+        None => {
+            log::warn!("Unknown optional pack '{}'", pack_id);
+            ui_controller.dispatch_patching_status(PatchingStatus::PackFailed(
+                pack_id.to_string(),
+                format!("unknown pack '{}'", pack_id),
+            ));
+            return;
+        }
+    };
+
+    match take_update_lock().with_context(|| "Failed to take the update lock") {
+        Err(err) => {
+            log::error!("{:#}", err);
+            ui_controller.dispatch_patching_status(PatchingStatus::PackFailed(
+                pack_id.to_string(),
+                format!("{:#}", err),
+            ));
+            return;
+        }
+        Ok(lock_file) => {
+            ui_controller.set_patch_in_progress(true);
+            let _guard = scopeguard::guard((), |_| {
+                let _ = lock_file.unlock();
+                ui_controller.set_patch_in_progress(false);
+            });
+
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_watch = cancelled.clone();
+            let cancel_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_done_for_task = cancel_done.clone();
+
+            // Polling listener: flips `cancelled` if a CancelPackDownload arrives.
+            // Stops itself when `cancel_done` is set by the main routine.
+            let rx_clone = patcher_thread_rx.clone();
+            let listener = tokio::spawn(async move {
+                use std::sync::atomic::Ordering;
+                loop {
+                    if cancel_done_for_task.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match rx_clone.try_recv() {
+                        Ok(PatcherCommand::CancelPackDownload)
+                        | Ok(PatcherCommand::Quit) => {
+                            cancel_watch.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(flume::TryRecvError::Empty) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                        Err(flume::TryRecvError::Disconnected) => break,
+                    }
+                }
+            });
+
+            let ui_for_cb = ui_controller.clone();
+            let pack_for_cb = pack.id.clone();
+            let progress_cb = move |evt: super::optional::PackProgress| {
+                use super::optional::PackProgress::*;
+                let status = match evt {
+                    Started { .. } => return, // start handled implicitly
+                    File {
+                        id,
+                        file_index,
+                        file_count,
+                        downloaded,
+                        total,
+                        bytes_per_sec,
+                        ..
+                    } => PatchingStatus::PackDownload(
+                        id, file_index, file_count, downloaded, total, bytes_per_sec,
+                    ),
+                    Verifying { id, file_name } => PatchingStatus::PackVerifying(id, file_name),
+                    Complete { id } => PatchingStatus::PackComplete(id),
+                    Cancelled { id } => PatchingStatus::PackCancelled(id),
+                    Failed { id, error } => PatchingStatus::PackFailed(id, error),
+                };
+                ui_for_cb.dispatch_patching_status(status);
+            };
+
+            let res =
+                super::optional::download_pack(pack.clone(), cancelled.clone(), progress_cb).await;
+            // Stop the listener cleanly.
+            cancel_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = listener.await;
+
+            match res {
+                Ok(()) => {
+                    log::info!("Optional pack '{}' downloaded", pack_for_cb);
+                    ui_controller.dispatch_patching_status(PatchingStatus::Ready);
+                }
+                Err(e) => {
+                    log::warn!("Optional pack '{}' download failed: {}", pack_for_cb, e);
                 }
             }
         }

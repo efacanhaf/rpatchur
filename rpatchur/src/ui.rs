@@ -9,6 +9,7 @@ use tinyfiledialogs as tfd;
 use web_view::{Content, Handle, WebView};
 
 /// 'Opaque" struct that can be used to update the UI.
+#[derive(Clone)]
 pub struct UiController {
     web_view_handle: Handle<WebViewUserData>,
 }
@@ -41,6 +42,27 @@ impl UiController {
                 PatchingStatus::ManualPatchApplied(name) => {
                     webview.eval(&format!("patchingStatusPatchApplied(\"{}\")", name))
                 }
+                PatchingStatus::PackDownload(id, fi, fc, downloaded, total, bps) => {
+                    webview.eval(&format!(
+                        "packDownloadProgress(\"{}\", {}, {}, {}, {}, {})",
+                        id, fi, fc, downloaded, total, bps
+                    ))
+                }
+                PatchingStatus::PackVerifying(id, file_name) => webview.eval(&format!(
+                    "packDownloadVerifying(\"{}\", \"{}\")",
+                    id, file_name
+                )),
+                PatchingStatus::PackComplete(id) => {
+                    webview.eval(&format!("packDownloadComplete(\"{}\")", id))
+                }
+                PatchingStatus::PackCancelled(id) => {
+                    webview.eval(&format!("packDownloadCancelled(\"{}\")", id))
+                }
+                PatchingStatus::PackFailed(id, err) => webview.eval(&format!(
+                    "packDownloadFailed(\"{}\", \"{}\")",
+                    id,
+                    err.replace('"', "\\\"")
+                )),
             };
             if let Err(e) = result {
                 log::warn!("Failed to dispatch patching status: {}.", e);
@@ -68,6 +90,12 @@ pub enum PatchingStatus {
     DownloadInProgress(usize, usize, u64), // Downloaded files, Total number, Bytes per second
     InstallationInProgress(usize, usize),  // Installed patches, Total number
     ManualPatchApplied(String),            // Patch file name
+    /// Pack id, current file index, total files, downloaded bytes, total bytes, bytes/sec
+    PackDownload(String, usize, usize, u64, u64, u64),
+    PackVerifying(String, String), // pack id, file name
+    PackComplete(String),          // pack id
+    PackCancelled(String),         // pack id
+    PackFailed(String, String),    // pack id, error message
 }
 
 pub struct WebViewUserData {
@@ -117,6 +145,8 @@ pub fn build_webview<'a>(
                 "cancel_update" => handle_cancel_update(webview),
                 "reset_cache" => handle_reset_cache(webview),
                 "manual_patch" => handle_manual_patch(webview),
+                "list_optional_packs" => handle_list_optional_packs(webview),
+                "cancel_pack_download" => handle_cancel_pack_download(webview),
                 request => handle_json_request(webview, request),
             }
             Ok(())
@@ -251,6 +281,7 @@ fn handle_json_request(webview: &mut WebView<WebViewUserData>, request: &str) {
                 match function_name {
                     "login" => handle_login(webview, function_params),
                     "open_url" => handle_open_url(function_params),
+                    "download_pack" => handle_download_pack(webview, function_params),
                     _ => {
                         log::error!("Unknown function '{}'", function_name);
                     }
@@ -316,6 +347,73 @@ fn handle_open_url(parameters: Value) {
                 log::error!("Error open_url function: '{}'", why);
             }
         },
+    }
+}
+
+/// Handles `list_optional_packs` — returns the configured optional packs as JSON to the UI.
+fn handle_list_optional_packs(webview: &mut WebView<WebViewUserData>) {
+    let packs = webview.user_data().patcher_config.optional_packs.clone();
+    let json = match serde_json::to_string(&packs) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to serialize optional packs: {}", e);
+            return;
+        }
+    };
+    let escaped = json.replace('\\', "\\\\").replace('\'', "\\'");
+    if let Err(e) = webview.eval(&format!("optionalPacksList('{}')", escaped)) {
+        log::warn!("Failed to dispatch optional packs list: {}", e);
+    }
+}
+
+/// Parameters expected for the `download_pack` JSON function.
+#[derive(Deserialize)]
+struct DownloadPackParameters {
+    id: String,
+}
+
+/// Handles `download_pack` — sends a `DownloadPack` command to the patching thread.
+fn handle_download_pack(webview: &mut WebView<WebViewUserData>, parameters: Value) {
+    let parsed: serde_json::Result<DownloadPackParameters> = serde_json::from_value(parameters);
+    match parsed {
+        Err(e) => log::error!("Invalid arguments given for 'download_pack': {}", e),
+        Ok(p) => {
+            // Refuse if any patching activity is already running.
+            if webview.user_data().patching_in_progress {
+                let _ = webview.eval("notificationInProgress()");
+                return;
+            }
+            if !webview
+                .user_data()
+                .patcher_config
+                .optional_packs
+                .iter()
+                .any(|op| op.id == p.id)
+            {
+                log::warn!("Unknown optional pack id requested: {}", p.id);
+                return;
+            }
+            if webview
+                .user_data_mut()
+                .patching_thread_tx
+                .send(PatcherCommand::DownloadPack(p.id))
+                .is_ok()
+            {
+                log::trace!("Sent DownloadPack command to patching thread");
+            }
+        }
+    }
+}
+
+/// Cancel an in-progress optional pack download.
+fn handle_cancel_pack_download(webview: &mut WebView<WebViewUserData>) {
+    if webview
+        .user_data_mut()
+        .patching_thread_tx
+        .send(PatcherCommand::CancelPackDownload)
+        .is_ok()
+    {
+        log::trace!("Sent CancelPackDownload command to patching thread");
     }
 }
 
