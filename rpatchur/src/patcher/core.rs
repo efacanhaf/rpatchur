@@ -86,7 +86,7 @@ async fn update_game(
             // Tell the UI and other processes that we're currently working
             ui_controller.set_patch_in_progress(true);
             let _guard = scopeguard::guard((), |_| {
-                let _ = lock_file.unlock();
+                let _ = AdvisoryFileLock::unlock(&lock_file);
                 ui_controller.set_patch_in_progress(false);
             });
 
@@ -122,7 +122,7 @@ fn apply_single_patch(
             // Tell the UI and other processes that we're currently working
             ui_controller.set_patch_in_progress(true);
             let _guard = scopeguard::guard((), |_| {
-                let _ = lock_file.unlock();
+                let _ = AdvisoryFileLock::unlock(&lock_file);
                 ui_controller.set_patch_in_progress(false);
             });
 
@@ -202,7 +202,7 @@ async fn run_optional_pack_download(
         Ok(lock_file) => {
             ui_controller.set_patch_in_progress(true);
             let _guard = scopeguard::guard((), |_| {
-                let _ = lock_file.unlock();
+                let _ = AdvisoryFileLock::unlock(&lock_file);
                 ui_controller.set_patch_in_progress(false);
             });
 
@@ -284,7 +284,9 @@ async fn run_optional_pack_download(
 fn take_update_lock() -> Result<std::fs::File> {
     let lock_file_name = get_update_lock_file_path()?;
     let lock_file = std::fs::File::create(lock_file_name)?;
-    lock_file.try_lock(FileLockMode::Exclusive)?;
+    // Disambiguate: stable Rust now ships an inherent `try_lock()` on `std::fs::File`
+    // that shadows `AdvisoryFileLock::try_lock`. Use the trait method explicitly.
+    AdvisoryFileLock::try_lock(&lock_file, FileLockMode::Exclusive)?;
 
     Ok(lock_file)
 }

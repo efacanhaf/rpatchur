@@ -79,7 +79,7 @@ async fn download_one<F>(
     file: &OptionalPackFile,
     dest: &Path,
     cancelled: Arc<AtomicBool>,
-    mut on_progress: F,
+    on_progress: &mut F,
 ) -> std::result::Result<(), InterruptibleFnError>
 where
     F: FnMut(u64, u64, u64),
@@ -181,23 +181,27 @@ where
 
         let pack_id = pack.id.clone();
         let file_name = file.name.clone();
-        let mut local_cb = {
-            let pack_id = pack_id.clone();
-            let file_name = file_name.clone();
-            move |downloaded: u64, total: u64, bps: u64| {
-                progress_cb(PackProgress::File {
-                    id: pack_id.clone(),
-                    file_index: i,
-                    file_count,
-                    file_name: file_name.clone(),
-                    downloaded,
-                    total,
-                    bytes_per_sec: bps,
-                });
-            }
+        // Wrap progress_cb in a local closure that adds file context.
+        // Borrow progress_cb mutably here so it isn't moved into the closure.
+        let progress_cb_ref = &mut progress_cb;
+        let pack_id_for_cb = pack_id.clone();
+        let file_name_for_cb = file_name.clone();
+        let mut local_cb = move |downloaded: u64, total: u64, bps: u64| {
+            (progress_cb_ref)(PackProgress::File {
+                id: pack_id_for_cb.clone(),
+                file_index: i,
+                file_count,
+                file_name: file_name_for_cb.clone(),
+                downloaded,
+                total,
+                bytes_per_sec: bps,
+            });
         };
 
-        match download_one(file, &dest, cancelled.clone(), &mut local_cb).await {
+        let one_result = download_one(file, &dest, cancelled.clone(), &mut local_cb).await;
+        // local_cb (and the &mut borrow of progress_cb) drops here.
+        drop(local_cb);
+        match one_result {
             Ok(()) => {
                 progress_cb(PackProgress::Verifying {
                     id: pack_id.clone(),
