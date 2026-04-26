@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
@@ -18,6 +17,19 @@ use tokio::io::AsyncWriteExt;
 
 use super::cancellation::InterruptibleFnError;
 use super::config::{OptionalPack, OptionalPackFile};
+
+/// Global cancel flag for optional-pack downloads. Set by `handle_cancel_pack_download`
+/// in `ui.rs`, reset and read by `download_pack`/`download_one` here. A static avoids
+/// the previous flume-listener race where a queued `DownloadPack` command could be
+/// silently consumed by the cancellation listener.
+pub static PACK_CANCEL: AtomicBool = AtomicBool::new(false);
+
+pub fn request_pack_cancel() {
+    PACK_CANCEL.store(true, Ordering::Relaxed);
+}
+pub fn reset_pack_cancel() {
+    PACK_CANCEL.store(false, Ordering::Relaxed);
+}
 
 /// Status of an optional pack download — pushed to the JS UI.
 #[derive(Clone)]
@@ -74,11 +86,10 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Download a single file with streaming + sha256, honoring a cancellation flag.
+/// Download a single file with streaming + sha256, honoring the global PACK_CANCEL flag.
 async fn download_one<F>(
     file: &OptionalPackFile,
     dest: &Path,
-    cancelled: Arc<AtomicBool>,
     on_progress: &mut F,
 ) -> std::result::Result<(), InterruptibleFnError>
 where
@@ -109,7 +120,7 @@ where
     let mut last_emit = Instant::now();
 
     while let Some(chunk) = stream.next().await {
-        if cancelled.load(Ordering::Relaxed) {
+        if PACK_CANCEL.load(Ordering::Relaxed) {
             let _ = fs::remove_file(&part_path).await;
             return Err(InterruptibleFnError::Interrupted);
         }
@@ -150,12 +161,12 @@ where
 /// progress events; `cancelled` is checked between (and during) chunk reads.
 pub async fn download_pack<F>(
     pack: OptionalPack,
-    cancelled: Arc<AtomicBool>,
     mut progress_cb: F,
 ) -> Result<()>
 where
     F: FnMut(PackProgress) + Send + 'static,
 {
+    reset_pack_cancel();
     let total_bytes: u64 = pack.files.iter().map(|f| f.size).sum();
     progress_cb(PackProgress::Started {
         id: pack.id.clone(),
@@ -198,7 +209,7 @@ where
             });
         };
 
-        let one_result = download_one(file, &dest, cancelled.clone(), &mut local_cb).await;
+        let one_result = download_one(file, &dest, &mut local_cb).await;
         // local_cb (and the &mut borrow of progress_cb) drops here.
         drop(local_cb);
         match one_result {

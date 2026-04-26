@@ -406,15 +406,9 @@ fn handle_download_pack(webview: &mut WebView<WebViewUserData>, parameters: Valu
 }
 
 /// Cancel an in-progress optional pack download.
-fn handle_cancel_pack_download(webview: &mut WebView<WebViewUserData>) {
-    if webview
-        .user_data_mut()
-        .patching_thread_tx
-        .send(PatcherCommand::CancelPackDownload)
-        .is_ok()
-    {
-        log::trace!("Sent CancelPackDownload command to patching thread");
-    }
+fn handle_cancel_pack_download(_webview: &mut WebView<WebViewUserData>) {
+    crate::patcher::optional::request_pack_cancel();
+    log::trace!("Pack cancel flag set");
 }
 
 fn start_game_client(webview: &mut WebView<WebViewUserData>, client_arguments: &[String]) {

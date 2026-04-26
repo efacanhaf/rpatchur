@@ -61,7 +61,10 @@ pub async fn patcher_thread_routine(
                     apply_single_patch(patch_file_path, &ui_controller, config);
                 }
                 PatcherCommand::DownloadPack(pack_id) => {
-                    run_optional_pack_download(&pack_id, &ui_controller, config, rx).await;
+                    run_optional_pack_download(&pack_id, &ui_controller, config).await;
+                }
+                PatcherCommand::CancelPackDownload => {
+                    super::optional::request_pack_cancel();
                 }
                 _ => {}
             },
@@ -171,7 +174,6 @@ async fn run_optional_pack_download(
     pack_id: &str,
     ui_controller: &UiController,
     config: &PatcherConfiguration,
-    patcher_thread_rx: &mut flume::Receiver<PatcherCommand>,
 ) {
     let pack = match config
         .optional_packs
@@ -206,41 +208,12 @@ async fn run_optional_pack_download(
                 ui_controller.set_patch_in_progress(false);
             });
 
-            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cancel_watch = cancelled.clone();
-            let cancel_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cancel_done_for_task = cancel_done.clone();
-
-            // Polling listener: flips `cancelled` if a CancelPackDownload arrives.
-            // Stops itself when `cancel_done` is set by the main routine.
-            let rx_clone = patcher_thread_rx.clone();
-            let listener = tokio::spawn(async move {
-                use std::sync::atomic::Ordering;
-                loop {
-                    if cancel_done_for_task.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match rx_clone.try_recv() {
-                        Ok(PatcherCommand::CancelPackDownload)
-                        | Ok(PatcherCommand::Quit) => {
-                            cancel_watch.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(flume::TryRecvError::Empty) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                        }
-                        Err(flume::TryRecvError::Disconnected) => break,
-                    }
-                }
-            });
-
             let ui_for_cb = ui_controller.clone();
             let pack_for_cb = pack.id.clone();
             let progress_cb = move |evt: super::optional::PackProgress| {
                 use super::optional::PackProgress::*;
                 let status = match evt {
-                    Started { .. } => return, // start handled implicitly
+                    Started { .. } => return,
                     File {
                         id,
                         file_index,
@@ -260,12 +233,7 @@ async fn run_optional_pack_download(
                 ui_for_cb.dispatch_patching_status(status);
             };
 
-            let res =
-                super::optional::download_pack(pack.clone(), cancelled.clone(), progress_cb).await;
-            // Stop the listener cleanly.
-            cancel_done.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = listener.await;
-
+            let res = super::optional::download_pack(pack.clone(), progress_cb).await;
             match res {
                 Ok(()) => {
                     log::info!("Optional pack '{}' downloaded", pack_for_cb);
