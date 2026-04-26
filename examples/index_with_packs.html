@@ -1,0 +1,164 @@
+<!--
+  Example index.html for rpatchur with optional_packs support.
+  Drop this in place of your existing launcher index, or copy the
+  Settings panel + JS into your own UI.
+-->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DimensionsRO Launcher</title>
+<style>
+  body { margin:0; font-family:system-ui, sans-serif; background:#140f0b; color:#fef0c0; }
+  .top { display:flex; gap:8px; padding:10px; background:rgba(216,160,80,0.1); }
+  .top button { background:rgba(216,160,80,0.2); color:#fef0c0; border:1px solid #c87028; padding:6px 12px; cursor:pointer; }
+  .panel { padding:14px; }
+  .pack { border:1px solid rgba(216,160,80,0.3); padding:10px 14px; margin-bottom:10px; border-radius:4px; }
+  .pack-head { display:flex; align-items:center; gap:10px; }
+  .pack-head input[type=checkbox] { transform:scale(1.4); margin-right:8px; }
+  .pack-head .label { font-weight:700; flex:1; }
+  .pack-head .size { color:#a89070; font-size:12px; }
+  .pack .desc { font-size:12px; color:#c8b890; margin:6px 0 8px 28px; }
+  .pack .progress { margin-left:28px; font-size:12px; color:#94d4a8; display:none; }
+  .pack.active .progress { display:block; }
+  .bar { height:5px; background:rgba(216,160,80,0.2); border-radius:3px; overflow:hidden; margin-top:4px; }
+  .bar > div { height:100%; width:0%; background:linear-gradient(90deg,#c87028,#f0a040,#94d4a8); transition:width 0.3s; }
+  .actions { display:flex; gap:10px; margin-top:14px; }
+  .actions button { padding:10px 20px; cursor:pointer; font-weight:700; }
+  .btn-play { background:linear-gradient(135deg,#c87028,#6a3a16); color:#fef0c0; border:1px solid #f0a040; flex:1; }
+  .btn-cancel { background:#aa3030; color:#fff; border:1px solid #ff5050; }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <button onclick="external.invoke('start_update')">Update</button>
+  <button onclick="showSettings()">Settings</button>
+  <button onclick="external.invoke('play')">Play</button>
+  <button onclick="external.invoke('exit')">Exit</button>
+</div>
+
+<div class="panel" id="settings-panel" style="display:none;">
+  <h2>Optional Content</h2>
+  <p>Select which packs to download. You can change this later.</p>
+  <div id="packs-container"></div>
+  <div class="actions">
+    <button class="btn-play" onclick="downloadSelected()">Download Selected</button>
+    <button class="btn-cancel" onclick="external.invoke('cancel_pack_download')">Cancel</button>
+  </div>
+</div>
+
+<script>
+  let packs = [];
+  let activePackId = null;
+  const queued = [];
+
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n/1048576).toFixed(1) + ' MB';
+    return (n/1073741824).toFixed(2) + ' GB';
+  }
+
+  function showSettings() {
+    document.getElementById('settings-panel').style.display = 'block';
+    external.invoke('list_optional_packs');
+  }
+
+  // Called from Rust after list_optional_packs.
+  function optionalPacksList(jsonStr) {
+    packs = JSON.parse(jsonStr);
+    renderPacks();
+  }
+
+  function renderPacks() {
+    const c = document.getElementById('packs-container');
+    c.innerHTML = '';
+    packs.forEach(p => {
+      const totalSize = p.files.reduce((s,f) => s + (f.size || 0), 0);
+      const div = document.createElement('div');
+      div.className = 'pack';
+      div.id = 'pack-' + p.id;
+      div.innerHTML = `
+        <div class="pack-head">
+          <input type="checkbox" id="chk-${p.id}" ${p.default_enabled ? 'checked' : ''}>
+          <span class="label">${p.label}</span>
+          <span class="size">${fmtBytes(totalSize)}</span>
+        </div>
+        ${p.description ? `<div class="desc">${p.description}</div>` : ''}
+        <div class="progress">
+          <span class="status">queued</span>
+          <div class="bar"><div></div></div>
+        </div>
+      `;
+      c.appendChild(div);
+    });
+  }
+
+  function downloadSelected() {
+    queued.length = 0;
+    packs.forEach(p => {
+      const chk = document.getElementById('chk-' + p.id);
+      if (chk && chk.checked) queued.push(p.id);
+    });
+    runNextDownload();
+  }
+
+  function runNextDownload() {
+    if (queued.length === 0) {
+      activePackId = null;
+      return;
+    }
+    activePackId = queued.shift();
+    const div = document.getElementById('pack-' + activePackId);
+    if (div) div.classList.add('active');
+    external.invoke(JSON.stringify({
+      function: 'download_pack',
+      parameters: { id: activePackId }
+    }));
+  }
+
+  // Progress callbacks invoked from Rust:
+  function packDownloadProgress(id, fileIndex, fileCount, downloaded, total, bps) {
+    const div = document.getElementById('pack-' + id);
+    if (!div) return;
+    const pct = total > 0 ? Math.floor(downloaded * 100 / total) : 0;
+    div.querySelector('.status').textContent =
+      `file ${fileIndex+1}/${fileCount} — ${fmtBytes(downloaded)}/${fmtBytes(total)} @ ${fmtBytes(bps)}/s`;
+    div.querySelector('.bar > div').style.width = pct + '%';
+  }
+  function packDownloadVerifying(id, fileName) {
+    const div = document.getElementById('pack-' + id);
+    if (div) div.querySelector('.status').textContent = 'verifying ' + fileName + '…';
+  }
+  function packDownloadComplete(id) {
+    const div = document.getElementById('pack-' + id);
+    if (div) {
+      div.querySelector('.status').textContent = '✓ done';
+      div.querySelector('.bar > div').style.width = '100%';
+    }
+    runNextDownload();
+  }
+  function packDownloadCancelled(id) {
+    const div = document.getElementById('pack-' + id);
+    if (div) div.querySelector('.status').textContent = 'cancelled';
+    queued.length = 0;
+    activePackId = null;
+  }
+  function packDownloadFailed(id, error) {
+    const div = document.getElementById('pack-' + id);
+    if (div) div.querySelector('.status').textContent = 'failed: ' + error;
+    queued.length = 0;
+    activePackId = null;
+  }
+
+  // Stubs the existing rpatchur UI calls (so this file works standalone).
+  function patchingStatusReady() {}
+  function patchingStatusError(_) {}
+  function patchingStatusDownloading(_,__,___) {}
+  function patchingStatusInstalling(_,__) {}
+  function patchingStatusPatchApplied(_) {}
+  function notificationInProgress() { alert('A patch operation is already in progress.'); }
+</script>
+</body>
+</html>

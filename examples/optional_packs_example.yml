@@ -1,0 +1,89 @@
+window:
+  title: DimensionsRO Launcher
+  width: 780
+  height: 580
+  resizable: false
+
+play:
+  path: Ragexe.exe
+  arguments: []
+  exit_on_success: true
+
+setup:
+  path: Setup.exe
+  arguments: []
+  exit_on_success: false
+
+web:
+  index_url: https://efacanhaf.github.io/dimensionsro-patches/index.html?v=12
+  preferred_patch_server: GitHub
+  patch_servers:
+    - name: GitHub
+      plist_url: https://efacanhaf.github.io/dimensionsro-patches/plist.txt
+      patch_url: https://efacanhaf.github.io/dimensionsro-patches/patches/
+
+client:
+  default_grf_name: server.grf
+
+patching:
+  in_place: true
+  check_integrity: true
+  create_grf: true
+
+# NEW: optional content packs the player can opt into.
+# Each pack maps to one or more files downloaded from any HTTP/HTTPS URL
+# (Cloudflare R2 recommended — egress is free).
+#
+# Replace the URLs and sha256/size values with the real ones after upload.
+optional_packs:
+  - id: mood
+    label: "Mood Pack"
+    description: "Cinematic per-city atmosphere via .gnd lightmap tinting"
+    default_enabled: true
+    files:
+      - name: mood.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/mood.grf
+        size: 11335656
+        sha256: REPLACE_WITH_SHA256
+
+  - id: skybox_hd
+    label: "Skybox HD"
+    description: "2x upscaled cloud + cloudback textures"
+    default_enabled: true
+    files:
+      - name: skybox-hd.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/skybox-hd.grf
+        size: 917729
+        sha256: REPLACE_WITH_SHA256
+
+  - id: hd_textures
+    label: "HD Textures (14.8 GB)"
+    description: "Real-ESRGAN x2 upscale of every map texture (52,297 BMPs)"
+    default_enabled: true
+    files:
+      - name: textures-hd.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/textures-hd.grf
+        size: 4101630384
+        sha256: REPLACE_WITH_SHA256
+      - name: textures-hd-2.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/textures-hd-2.grf
+        size: 4090650440
+        sha256: REPLACE_WITH_SHA256
+      - name: textures-hd-3.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/textures-hd-3.grf
+        size: 3836773300
+        sha256: REPLACE_WITH_SHA256
+      - name: textures-hd-4.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/textures-hd-4.grf
+        size: 3604001425
+        sha256: REPLACE_WITH_SHA256
+
+  - id: kro_data
+    label: "kRO Data (4 GB)"
+    description: "Original Korean Ragnarok Online assets — required for first install"
+    default_enabled: true
+    files:
+      - name: data.grf
+        url: https://pub-XXXXXXXX.r2.dev/dimensionsro/data.grf
+        size: 4219601980
+        sha256: REPLACE_WITH_SHA256
