@@ -372,17 +372,11 @@ struct DownloadPackParameters {
     id: String,
 }
 
-/// Handles `download_pack` — sends a `DownloadPack` command to the patching thread.
 fn handle_download_pack(webview: &mut WebView<WebViewUserData>, parameters: Value) {
     let parsed: serde_json::Result<DownloadPackParameters> = serde_json::from_value(parameters);
     match parsed {
         Err(e) => log::error!("Invalid arguments given for 'download_pack': {}", e),
         Ok(p) => {
-            // Refuse if any patching activity is already running.
-            if webview.user_data().patching_in_progress {
-                let _ = webview.eval("notificationInProgress()");
-                return;
-            }
             if !webview
                 .user_data()
                 .patcher_config
