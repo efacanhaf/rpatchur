@@ -100,8 +100,13 @@ async fn update_game(
                     ui_controller
                         .dispatch_patching_status(PatchingStatus::Error(format!("{:#}", err)));
                 }
-                Ok(()) => {
-                    ui_controller.dispatch_patching_status(PatchingStatus::Ready);
+                Ok(self_update_pending) => {
+                    let status = if self_update_pending {
+                        PatchingStatus::ReadyAfterUpdate
+                    } else {
+                        PatchingStatus::Ready
+                    };
+                    ui_controller.dispatch_patching_status(status);
                     log::info!("Patching finished!");
                 }
             }
@@ -155,11 +160,15 @@ fn apply_single_patch(
                                 err
                             )));
                         }
-                        Ok(()) => {
+                        Ok(touched_self) => {
                             log::info!("Done");
                             ui_controller.dispatch_patching_status(
                                 PatchingStatus::ManualPatchApplied(patch_file_name),
                             );
+                            if touched_self {
+                                ui_controller
+                                    .dispatch_patching_status(PatchingStatus::ReadyAfterUpdate);
+                            }
                         }
                     }
                 }
@@ -267,7 +276,7 @@ async fn interruptible_update_routine(
     ui_controller: &UiController,
     config: &PatcherConfiguration,
     patcher_thread_rx: &mut flume::Receiver<PatcherCommand>,
-) -> Result<()> {
+) -> Result<bool> {
     log::info!("Start patching");
 
     // Find a patch server that we can connect to
@@ -320,7 +329,7 @@ async fn interruptible_update_routine(
 
     // Proceed with actual patching
     log::info!("Applying patches ...");
-    apply_patches(
+    let self_update_pending = apply_patches(
         pending_patch_queue,
         config,
         &cache_file_path,
@@ -334,7 +343,7 @@ async fn interruptible_update_routine(
     })?;
     log::info!("Patches have been applied");
 
-    Ok(())
+    Ok(self_update_pending)
 }
 
 /// Iterates through `server_list` and returns the first available server's info.
@@ -434,7 +443,24 @@ fn get_cache_file_path() -> Result<PathBuf> {
 
 /// Returns the patcher update lock file's name as a `PathBuf` on success.
 fn get_update_lock_file_path() -> Result<PathBuf> {
-    get_instance_asset_file_name("lock")
+    // The launcher may be installed to a read-only directory (Program Files),
+    // so place the lock under the user's local-data directory instead. Falls
+    // back to CWD if neither LOCALAPPDATA nor TEMP is available.
+    let patcher_name = get_patcher_name()?;
+    let stem: PathBuf = PathBuf::from(&patcher_name);
+    let file = stem.with_extension("lock");
+
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("TEMP"))
+        .map(PathBuf::from);
+    if let Some(base) = base {
+        let dir = base.join("DimensionsRO");
+        let _ = std::fs::create_dir_all(&dir);
+        if dir.exists() {
+            return Ok(dir.join(file.file_name().unwrap_or_default()));
+        }
+    }
+    Ok(file)
 }
 
 /// Generates asset file names which are associated with the current 'instance'
@@ -653,7 +679,7 @@ async fn apply_patches(
     cache_file_path: impl AsRef<Path>,
     ui_controller: &UiController,
     patching_thread_rx: &mut flume::Receiver<PatcherCommand>,
-) -> InterruptibleFnResult<()> {
+) -> InterruptibleFnResult<bool> {
     let current_working_dir = env::current_dir().map_err(|e| {
         InterruptibleFnError::Err(format!(
             "Failed to resolve current working directory: {}.",
@@ -661,6 +687,7 @@ async fn apply_patches(
         ))
     })?;
     let patch_count = pending_patch_queue.len();
+    let mut self_update_pending = false;
     ui_controller.dispatch_patching_status(PatchingStatus::InstallationInProgress(0, patch_count));
     for (patch_number, pending_patch) in pending_patch_queue.into_iter().enumerate() {
         // Cancel the patching process if we've been asked to or if the other
@@ -669,9 +696,18 @@ async fn apply_patches(
 
         let patch_name = pending_patch.info.file_name;
         log::info!("Processing {}", patch_name);
-        apply_patch(pending_patch.local_file_path, config, &current_working_dir).map_err(|e| {
-            InterruptibleFnError::Err(format!("Failed to apply patch '{}': {}.", patch_name, e))
-        })?;
+        let touched_self =
+            apply_patch(pending_patch.local_file_path, config, &current_working_dir).map_err(
+                |e| {
+                    InterruptibleFnError::Err(format!(
+                        "Failed to apply patch '{}': {}.",
+                        patch_name, e
+                    ))
+                },
+            )?;
+        if touched_self {
+            self_update_pending = true;
+        }
         // Update the cache file with the last successful patch's index
         if let Err(e) = write_cache_file(
             &cache_file_path,
@@ -689,14 +725,17 @@ async fn apply_patches(
             patch_count,
         ));
     }
-    Ok(())
+    Ok(self_update_pending)
 }
 
+/// Applies a single THOR patch. Returns `Ok(true)` if the patch touches the
+/// launcher's own configuration file (`DimensionsRO.yml`), so callers can
+/// trigger a relaunch to re-read fresh integrity hashes.
 fn apply_patch(
     thor_archive_path: impl AsRef<Path>,
     config: &PatcherConfiguration,
     current_working_dir: impl AsRef<Path>,
-) -> Result<()> {
+) -> Result<bool> {
     let mut thor_archive = ThorArchive::open(thor_archive_path.as_ref())?;
     if thor_archive.use_grf_merging() {
         // Patch GRF file
@@ -718,10 +757,17 @@ fn apply_patch(
             config.patching.create_grf,
             target_grf_path,
             &mut thor_archive,
-        )
+        )?;
+        // GRF patches never carry DimensionsRO.yml.
+        Ok(false)
     } else {
         // Patch root directory
-        apply_patch_to_disk(current_working_dir, &mut thor_archive)
+        let touched_self = thor_archive
+            .get_entries()
+            .filter(|e| !e.is_internal() && !e.is_removed)
+            .any(|e| e.relative_path.eq_ignore_ascii_case("DimensionsRO.yml"));
+        apply_patch_to_disk(current_working_dir, &mut thor_archive)?;
+        Ok(touched_self)
     }
 }
 

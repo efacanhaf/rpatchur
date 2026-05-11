@@ -58,6 +58,7 @@ fn install_path(file_name: &str) -> Result<PathBuf> {
 }
 
 /// Returns true if `path` already matches `expected_size` and `expected_sha256`.
+/// Aborts (returns false) if PACK_CANCEL is set during verification.
 async fn already_installed(path: &Path, expected_size: u64, expected_sha256: &str) -> bool {
     let meta = match fs::metadata(path).await {
         Ok(m) => m,
@@ -77,6 +78,9 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
+        if PACK_CANCEL.load(Ordering::Relaxed) {
+            anyhow::bail!("verification cancelled");
+        }
         let n = tokio::io::AsyncReadExt::read(&mut f, &mut buf).await?;
         if n == 0 {
             break;
@@ -175,7 +179,17 @@ where
 
     let file_count = pack.files.len();
     for (i, file) in pack.files.iter().enumerate() {
+        if PACK_CANCEL.load(Ordering::Relaxed) {
+            progress_cb(PackProgress::Cancelled { id: pack.id });
+            return Err(anyhow!("pack download cancelled"));
+        }
         let dest = install_path(&file.name)?;
+        // Emit a Verifying event before the (potentially long) sha256 read,
+        // so the UI shows progress while we re-validate already-present files.
+        progress_cb(PackProgress::Verifying {
+            id: pack.id.clone(),
+            file_name: file.name.clone(),
+        });
         if already_installed(&dest, file.size, &file.sha256).await {
             log::info!("pack {} file {} already valid, skipping", pack.id, file.name);
             progress_cb(PackProgress::File {
@@ -188,6 +202,12 @@ where
                 bytes_per_sec: 0,
             });
             continue;
+        }
+        // already_installed returns false if cancel was hit during the sha256
+        // read; propagate cancel before proceeding to download.
+        if PACK_CANCEL.load(Ordering::Relaxed) {
+            progress_cb(PackProgress::Cancelled { id: pack.id });
+            return Err(anyhow!("pack download cancelled"));
         }
 
         let pack_id = pack.id.clone();

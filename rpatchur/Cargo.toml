@@ -7,10 +7,12 @@ build = "build.rs"
 description = "A customizable patcher for Ragnarok Online"
 
 [package.metadata.winres]
-FileDescription = "A customizable patcher for Ragnarok Online"
-ProductName = "RPatchur"
-ProductVersion = "0.3.0"
-LegalCopyright = "Copyright © 2020-2021 rpatchur developers"
+FileDescription = "DimensionsRO Launcher"
+ProductName = "DimensionsRO"
+ProductVersion = "1.0.0"
+LegalCopyright = "Copyright © 2026 DimensionsRO Team"
+OriginalFilename = "DimensionsRO.exe"
+InternalName = "DimensionsRO"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -39,7 +41,7 @@ advisory-lock = "0.3"
 sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3.6", features = ["shellapi"] }
+winapi = { version = "0.3.6", features = ["shellapi", "winuser", "windef"] }
 
 [dev-dependencies]
 twox-hash = "1.5"

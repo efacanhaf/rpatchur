@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub use self::config::{retrieve_patcher_configuration, OptionalPack, OptionalPackFile, PatcherConfiguration};
+pub use self::config::{retrieve_patcher_configuration, ModeArtifacts, ModeArtifactSet, OptionalPack, OptionalPackFile, PatcherConfiguration};
 pub use self::core::patcher_thread_routine;
 use anyhow::{Context, Result};
 

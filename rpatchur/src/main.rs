@@ -68,6 +68,14 @@ fn main() -> Result<()> {
     )
     .with_context(|| "Failed to build a web view")?;
 
+    // Strip WS_MAXIMIZEBOX so the maximize button disappears (resizable=false
+    // greys it but doesn't hide it on Windows).
+    #[cfg(windows)]
+    {
+        let title_clone = window_title.clone();
+        std::thread::spawn(move || disable_maximize_button(&title_clone));
+    }
+
     // Spawn a patching thread
     let patching_thread = new_patching_thread(rx, UiController::new(&webview), config);
     webview
@@ -80,6 +88,57 @@ fn main() -> Result<()> {
         .with_context(|| "Patching thread ran into an error")?;
 
     Ok(())
+}
+
+/// Polls for the launcher window by title and removes WS_MAXIMIZEBOX so the
+/// maximize button is hidden (and the window is no longer fullscreen-able).
+#[cfg(windows)]
+fn disable_maximize_button(title: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::thread::sleep;
+    use std::time::Duration;
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{
+        FindWindowW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_MAXIMIZEBOX,
+    };
+
+    let title_w: Vec<u16> = OsStr::new(title)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Poll up to ~5 seconds; the window is created on the UI thread which
+    // hasn't started its event loop yet at this point.
+    let mut hwnd: HWND = std::ptr::null_mut();
+    for _ in 0..50 {
+        unsafe {
+            hwnd = FindWindowW(std::ptr::null(), title_w.as_ptr());
+            if !hwnd.is_null() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100));
+    }
+    if hwnd.is_null() {
+        return;
+    }
+
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let new_style = style & !(WS_MAXIMIZEBOX as isize);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
 }
 
 /// Spawns a new thread that runs a single threaded tokio runtime to execute the patcher routine

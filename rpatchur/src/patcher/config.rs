@@ -16,6 +16,20 @@ pub struct PatcherConfiguration {
     pub patching: PatchingConfiguration,
     #[serde(default)]
     pub optional_packs: Vec<OptionalPack>,
+    #[serde(default)]
+    pub mode_artifacts: ModeArtifacts,
+}
+
+#[derive(Deserialize, Clone, Default)]
+pub struct ModeArtifacts {
+    pub vanilla: Option<ModeArtifactSet>,
+    pub hd: Option<ModeArtifactSet>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ModeArtifactSet {
+    pub ragexe_sha256: String,
+    pub dataini_sha256: String,
 }
 
 #[derive(Deserialize, Clone, serde::Serialize)]
