@@ -163,6 +163,7 @@ pub fn build_webview<'a>(
                 "get_active_mode" => handle_get_active_mode(webview),
                 "cleanup_hd" => handle_cleanup_hd(webview),
                 "verify_play" => handle_verify_play(webview),
+                "is_launcher_update_pending" => handle_is_launcher_update_pending(webview),
                 request => handle_json_request(webview, request),
             }
             Ok(())
@@ -302,6 +303,24 @@ fn handle_setup(webview: &mut WebView<WebViewUserData>) {
 /// Exits the patcher cleanly.
 fn handle_exit(webview: &mut WebView<WebViewUserData>) {
     webview.exit();
+}
+
+/// Reports whether a pending launcher swap is staged on disk. The JS layer
+/// uses this to decide whether to repurpose the Play button into "APLICAR
+/// ATUALIZAÇÃO DO LAUNCHER" — once dro_update.exe has consumed
+/// `DimensionsRO.exe.new`, the file is gone and the button stays as Play.
+fn handle_is_launcher_update_pending(webview: &mut WebView<WebViewUserData>) {
+    let pending = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        Some(dir) => dir.join("DimensionsRO.exe.new").exists(),
+        None => false,
+    };
+    let _ = webview.eval(&format!(
+        "launcherUpdatePendingResult({})",
+        if pending { "true" } else { "false" }
+    ));
 }
 
 /// Spawns a fresh copy of the launcher and exits the current one. Used after a
