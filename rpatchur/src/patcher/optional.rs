@@ -91,6 +91,13 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
 }
 
 /// Download a single file with streaming + sha256, honoring the global PACK_CANCEL flag.
+///
+/// Supports resume: if a `.part` file already exists, its size is treated as
+/// the start offset and a `Range: bytes=<N>-` header is sent. The server's
+/// response (200 = full restart, 206 = partial) decides whether we append or
+/// truncate. The final integrity check re-hashes the assembled `.part` once
+/// the byte stream completes, since we cannot keep an incremental Sha256
+/// state across launcher restarts.
 async fn download_one<F>(
     file: &OptionalPackFile,
     dest: &Path,
@@ -100,36 +107,70 @@ where
     F: FnMut(u64, u64, u64),
 {
     let part_path = dest.with_extension("part");
-    let _ = fs::remove_file(&part_path).await; // best-effort
+
+    // Existing partial download? Range-request to resume.
+    let resume_from: u64 = match fs::metadata(&part_path).await {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
 
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| InterruptibleFnError::Err(format!("client build: {}", e)))?;
-    let resp = client
-        .get(&file.url)
+    let mut req = client.get(&file.url);
+    if resume_from > 0 && resume_from < file.size {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", resume_from));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| InterruptibleFnError::Err(format!("GET {}: {}", file.url, e)))?
         .error_for_status()
         .map_err(|e| InterruptibleFnError::Err(format!("HTTP error: {}", e)))?;
 
-    let total = resp.content_length().unwrap_or(file.size);
+    // Did the server honor the range request?
+    let status = resp.status().as_u16();
+    let resuming = resume_from > 0 && resume_from < file.size && status == 206;
+    if resume_from > 0 && !resuming {
+        log::info!("server returned {} not 206; restarting download of {} from byte 0", status, file.name);
+        let _ = fs::remove_file(&part_path).await;
+    }
+
+    let body_len = resp.content_length();
+    let total = if resuming {
+        body_len.map(|c| resume_from + c).unwrap_or(file.size)
+    } else {
+        body_len.unwrap_or(file.size)
+    };
+
     let mut stream = resp.bytes_stream();
-    let mut out = fs::File::create(&part_path)
-        .await
-        .map_err(|e| InterruptibleFnError::Err(format!("create part: {}", e)))?;
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
+    let mut out = if resuming {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| InterruptibleFnError::Err(format!("append part: {}", e)))?
+    } else {
+        fs::File::create(&part_path)
+            .await
+            .map_err(|e| InterruptibleFnError::Err(format!("create part: {}", e)))?
+    };
+
+    let mut downloaded: u64 = if resuming { resume_from } else { 0 };
     let started = Instant::now();
+    let started_bytes = downloaded;
     let mut last_emit = Instant::now();
+
+    // Emit an initial progress event so the UI immediately reflects the
+    // resume offset (otherwise the bar starts at 0 even when 80% is on disk).
+    on_progress(downloaded, total, 0);
 
     while let Some(chunk) = stream.next().await {
         if PACK_CANCEL.load(Ordering::Relaxed) {
-            let _ = fs::remove_file(&part_path).await;
+            // Don't delete .part on cancel — leave it for the next resume.
             return Err(InterruptibleFnError::Interrupted);
         }
         let chunk = chunk.map_err(|e| InterruptibleFnError::Err(format!("recv: {}", e)))?;
-        hasher.update(&chunk);
         out.write_all(&chunk)
             .await
             .map_err(|e| InterruptibleFnError::Err(format!("write: {}", e)))?;
@@ -137,7 +178,7 @@ where
 
         if last_emit.elapsed().as_millis() > 250 {
             let secs = started.elapsed().as_secs_f64().max(0.001);
-            let bps = (downloaded as f64 / secs) as u64;
+            let bps = (((downloaded - started_bytes) as f64) / secs) as u64;
             on_progress(downloaded, total, bps);
             last_emit = Instant::now();
         }
@@ -147,8 +188,15 @@ where
         .map_err(|e| InterruptibleFnError::Err(format!("flush: {}", e)))?;
     drop(out);
 
-    let got = format!("{:x}", hasher.finalize());
+    // Hash the assembled .part. The caller already emits a "Verifying"
+    // status before download_one; this call is just the final integrity
+    // check before we promote .part to its final name.
+    let got = sha256_of_file(&part_path)
+        .await
+        .map_err(|e| InterruptibleFnError::Err(format!("sha256 verify: {}", e)))?;
     if !got.eq_ignore_ascii_case(&file.sha256) {
+        // Hash mismatch is a hard failure — delete .part so the next
+        // attempt starts clean rather than appending more bad bytes.
         let _ = fs::remove_file(&part_path).await;
         return Err(InterruptibleFnError::Err(format!(
             "checksum mismatch for {}: expected {}, got {}",

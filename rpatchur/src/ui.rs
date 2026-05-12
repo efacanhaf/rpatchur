@@ -123,8 +123,14 @@ impl WebViewUserData {
 }
 impl Drop for WebViewUserData {
     fn drop(&mut self) {
-        // Ask the patching thread to stop whenever WebViewUserData is dropped
+        // Ask the patching thread to stop whenever WebViewUserData is dropped.
+        // The Quit command is consumed at the next iteration of the patcher
+        // loop, which doesn't help if a long-running download is mid-stream;
+        // also raise the global PACK_CANCEL flag so download_one bails on
+        // its next chunk read. Without this the launcher process keeps
+        // hammering the URL after the window closes.
         let _res = self.patching_thread_tx.try_send(PatcherCommand::Quit);
+        crate::patcher::optional::request_pack_cancel();
     }
 }
 

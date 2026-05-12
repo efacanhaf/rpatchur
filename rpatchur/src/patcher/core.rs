@@ -20,10 +20,16 @@ use super::cache::{read_cache_file, write_cache_file, PatcherCache};
 use super::cancellation::{
     process_incoming_commands, wait_for_cancellation, InterruptibleFnError, InterruptibleFnResult,
 };
-use super::config::PatchServerInfo;
+use super::config::{OptionalPack, OptionalPackFile, PatchServerInfo, RequiredFile};
 use super::patching::{apply_patch_to_disk, apply_patch_to_grf, GrfPatchingMethod};
 use super::{get_patcher_name, PatcherCommand, PatcherConfiguration};
 use crate::ui::{PatchingStatus, UiController};
+
+/// Reserved pack id used when downloading entries from the top-level
+/// `required_files:` YAML section. The UI treats this id as a regular
+/// pack-download event but renders it as "Game Data" rather than as an
+/// optional add-on.
+const REQUIRED_FILES_PACK_ID: &str = "_required";
 
 /// Representation of a pending patch (a patch that's been downloaded but has
 /// not been applied yet).
@@ -72,12 +78,82 @@ pub async fn patcher_thread_routine(
     }
 }
 
+/// Ensures every entry in `required_files:` exists on disk and matches the
+/// expected size+sha256. Missing or stale entries are downloaded from the
+/// configured URL using the same machinery as optional packs. Returns Err
+/// if any required file could not be obtained — callers must abort the
+/// patching flow (and refuse to enable PLAY) in that case.
+async fn ensure_required_files(
+    ui_controller: &UiController,
+    required: &[RequiredFile],
+) -> Result<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let pack_files: Vec<OptionalPackFile> = required
+        .iter()
+        .map(|r| OptionalPackFile {
+            name: r.name.clone(),
+            url: r.url.clone(),
+            size: r.size,
+            sha256: r.sha256.clone(),
+        })
+        .collect();
+    let pack = OptionalPack {
+        id: REQUIRED_FILES_PACK_ID.to_string(),
+        label: "Game Data".to_string(),
+        description: String::new(),
+        default_enabled: true,
+        files: pack_files,
+    };
+
+    let ui_for_cb = ui_controller.clone();
+    let progress_cb = move |evt: super::optional::PackProgress| {
+        use super::optional::PackProgress::*;
+        let status = match evt {
+            Started { .. } => return,
+            File {
+                id,
+                file_index,
+                file_count,
+                downloaded,
+                total,
+                bytes_per_sec,
+                ..
+            } => PatchingStatus::PackDownload(
+                id, file_index, file_count, downloaded, total, bytes_per_sec,
+            ),
+            Verifying { id, file_name } => PatchingStatus::PackVerifying(id, file_name),
+            Complete { id } => PatchingStatus::PackComplete(id),
+            // Cancellation isn't user-initiated for required files. Surface as failure.
+            Cancelled { id } => PatchingStatus::PackFailed(id, "interrupted".to_string()),
+            Failed { id, error } => PatchingStatus::PackFailed(id, error),
+        };
+        ui_for_cb.dispatch_patching_status(status);
+    };
+
+    super::optional::download_pack(pack, progress_cb)
+        .await
+        .context("required-files download failed")
+}
+
 /// Starts the automatic update process (download + patching)
 async fn update_game(
     ui_controller: &UiController,
     config: &PatcherConfiguration,
     patcher_thread_rx: &mut flume::Receiver<PatcherCommand>,
 ) {
+    // Gate the whole flow on required base files (data.grf, etc). If any
+    // required entry is missing or hash-mismatched, fetch it first. THOR
+    // patches that target server.grf assume data.grf already exists, so
+    // this MUST complete before update_routine runs.
+    if let Err(err) = ensure_required_files(ui_controller, &config.required_files).await {
+        log::error!("required-files preflight failed: {:#}", err);
+        ui_controller
+            .dispatch_patching_status(PatchingStatus::Error(format!("{:#}", err)));
+        return;
+    }
+
     // Try taking the update lock
     match take_update_lock().with_context(|| "Failed to take the update lock") {
         Err(err) => {

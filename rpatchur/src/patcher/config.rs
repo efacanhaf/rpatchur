@@ -17,7 +17,17 @@ pub struct PatcherConfiguration {
     #[serde(default)]
     pub optional_packs: Vec<OptionalPack>,
     #[serde(default)]
+    pub required_files: Vec<RequiredFile>,
+    #[serde(default)]
     pub mode_artifacts: ModeArtifacts,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct RequiredFile {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    pub sha256: String,
 }
 
 #[derive(Deserialize, Clone, Default)]
