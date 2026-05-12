@@ -1,0 +1,16 @@
+[package]
+name = "dro_update"
+version = "0.1.0"
+edition = "2018"
+description = "DimensionsRO launcher self-update helper. Swaps DimensionsRO.exe.new over DimensionsRO.exe once the running launcher releases its lock, then relaunches. Falls back to running Setup.exe when no staged update is present so the existing 'gear' button keeps working."
+
+[package.metadata.winres]
+FileDescription = "DimensionsRO Update Helper"
+ProductName = "DimensionsRO"
+ProductVersion = "0.1.0"
+LegalCopyright = "Copyright (c) 2026 DimensionsRO Team"
+OriginalFilename = "dro_update.exe"
+InternalName = "dro_update"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

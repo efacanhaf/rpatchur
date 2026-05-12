@@ -3,4 +3,4 @@ lto = true
 panic = 'abort'
 
 [workspace]
-members = ["gruf", "rpatchur", "mkpatch"]
+members = ["gruf", "rpatchur", "mkpatch", "dro_update"]
