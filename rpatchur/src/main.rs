@@ -46,6 +46,13 @@ fn main() -> Result<()> {
             .with_context(|| "Specified working directory is invalid or inaccessible")?;
     };
 
+    // Clean up the leftover `<exe>.old` that the previous launcher instance
+    // moved aside when applying a self-update. We can only do this now —
+    // before that prior process exits, Windows still holds the image lock
+    // on it. Best-effort: a failure here just means the stale file lingers
+    // until the next launch.
+    clean_stale_self_update_artifacts();
+
     let config = match retrieve_patcher_configuration(None) {
         Err(e) => {
             let err_msg = "Failed to retrieve the patcher's configuration";
@@ -90,6 +97,25 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Delete the `<exe>.old` companion that's left behind after a self-update.
+/// `apply_patch_to_disk::stage_self_for_replace` renames the running launcher
+/// out of the way before extracting the new binary; once we reach this point
+/// in the *new* process, the previous instance has already exited and the
+/// `.old` file is just dead weight.
+fn clean_stale_self_update_artifacts() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut old_path = exe.clone();
+    let ext = match old_path.extension() {
+        Some(e) => format!("{}.old", e.to_string_lossy()),
+        None => "old".to_string(),
+    };
+    old_path.set_extension(ext);
+    let _ = std::fs::remove_file(&old_path);
+}
+
 /// Polls for the launcher window by title and removes WS_MAXIMIZEBOX so the
 /// maximize button is hidden (and the window is no longer fullscreen-able).
 #[cfg(windows)]
@@ -127,7 +153,13 @@ fn disable_maximize_button(title: &str) {
 
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let new_style = style & !(WS_MAXIMIZEBOX as isize);
+        // LONG_PTR is i32 on i686 (the target we ship) and i64 on x64. We
+        // only build for i686 in CI, so settle on i32 explicitly to keep
+        // bitand operand types in sync.
+        #[cfg(target_pointer_width = "32")]
+        let new_style: i32 = style & !(WS_MAXIMIZEBOX as i32);
+        #[cfg(target_pointer_width = "64")]
+        let new_style: isize = style & !(WS_MAXIMIZEBOX as isize);
         SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
         SetWindowPos(
             hwnd,

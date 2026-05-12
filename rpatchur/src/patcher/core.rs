@@ -837,11 +837,18 @@ fn apply_patch(
         // GRF patches never carry DimensionsRO.yml.
         Ok(false)
     } else {
-        // Patch root directory
+        // Patch root directory. We treat the YAML config and the launcher
+        // binary itself as "self" — both demand a relaunch after the patch
+        // applies. The YAML because in-memory hashes are stale; the .exe
+        // because we just rename-swapped the running image out and a fresh
+        // process needs to come up against the new binary.
         let touched_self = thor_archive
             .get_entries()
             .filter(|e| !e.is_internal() && !e.is_removed)
-            .any(|e| e.relative_path.eq_ignore_ascii_case("DimensionsRO.yml"));
+            .any(|e| {
+                e.relative_path.eq_ignore_ascii_case("DimensionsRO.yml")
+                    || e.relative_path.eq_ignore_ascii_case("DimensionsRO.exe")
+            });
         apply_patch_to_disk(current_working_dir, &mut thor_archive)?;
         Ok(touched_self)
     }

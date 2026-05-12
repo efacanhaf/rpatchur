@@ -144,6 +144,16 @@ fn apply_patch_to_grf_oop<R: Read + Seek>(
 
 /// Patches files located in the game client's directory with a THOR
 /// archive/patch.
+///
+/// Self-update note: Windows holds an exclusive image lock on the running
+/// launcher, so `File::create` over its own .exe fails with "os error 32".
+/// `fs::rename`, however, is allowed even on a running executable (MoveFileEx
+/// will happily move an open image, just not delete it). We exploit that
+/// here: when the entry's resolved destination matches our `current_exe`, we
+/// move the live binary aside to `<name>.old` before extracting. The fresh
+/// binary lands at the original path, and a boot-time cleanup (see
+/// `main::clean_stale_self_update_artifacts`) deletes the `.old` file the
+/// next time the launcher starts.
 pub fn apply_patch_to_disk<R: Read + Seek>(
     root_directory: impl AsRef<Path>,
     thor_archive: &mut ThorArchive<R>,
@@ -157,6 +167,9 @@ pub fn apply_patch_to_disk<R: Read + Seek>(
         .cloned()
         .collect();
     file_entries.sort_unstable_by(|a, b| a.offset.cmp(&b.offset));
+
+    let current_exe = std::env::current_exe().ok().and_then(|p| canonicalize_or(&p));
+
     for entry in file_entries {
         let dest_path = join_windows_relative_path(root_directory.as_ref(), &entry.relative_path);
         if entry.is_removed {
@@ -167,11 +180,53 @@ pub fn apply_patch_to_disk<R: Read + Seek>(
             if let Some(parent_dir) = dest_path.parent() {
                 fs::create_dir_all(parent_dir)?
             }
+            // If we're about to overwrite our own running .exe, move it aside
+            // first so File::create has a clear slot.
+            stage_self_for_replace(&dest_path, current_exe.as_deref())?;
             // Extract file
             thor_archive.extract_file(&entry.relative_path, &dest_path)?;
         }
     }
     Ok(())
+}
+
+/// If `dest_path` resolves to the running launcher executable, move that
+/// running image aside to `<dest>.old` so a fresh binary can be extracted in
+/// its place. Idempotent — a leftover `.old` is removed first. Best-effort:
+/// on any failure we leave the filesystem untouched so the subsequent
+/// `File::create` returns the original "file in use" error.
+fn stage_self_for_replace(dest_path: &Path, current_exe: Option<&Path>) -> Result<()> {
+    let current_exe = match current_exe {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let dest_canonical = match canonicalize_or(dest_path) {
+        Some(c) => c,
+        None => return Ok(()), // file doesn't exist yet — normal extract path
+    };
+    if dest_canonical != current_exe {
+        return Ok(());
+    }
+
+    let mut old_path = dest_path.to_path_buf();
+    let ext = match old_path.extension() {
+        Some(e) => format!("{}.old", e.to_string_lossy()),
+        None => "old".to_string(),
+    };
+    old_path.set_extension(ext);
+
+    // Clean up any leftover from a prior aborted update before we move.
+    let _ = fs::remove_file(&old_path);
+
+    fs::rename(dest_path, &old_path)?;
+    Ok(())
+}
+
+/// `std::fs::canonicalize` returns `\\?\C:\…` on Windows; that prefix doesn't
+/// match `std::env::current_exe()` output. We normalize both sides through
+/// the same function to make path equality reliable.
+fn canonicalize_or(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
 
 /// Utility function used to join path-like segments the same way it's done in
