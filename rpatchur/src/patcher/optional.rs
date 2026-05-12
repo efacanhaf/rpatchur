@@ -90,6 +90,20 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Outcome of a single stream attempt. `Transient` covers mid-stream
+/// disconnects (the Oracle storage backend cuts the connection partway
+/// through 5 GB downloads more often than not); `Fatal` is anything we
+/// shouldn't retry on (bad URL, hash mismatch, write failure, cancel).
+enum StreamOutcome {
+    Done,
+    Transient(String),
+    Fatal(InterruptibleFnError),
+}
+
+/// Max number of transient mid-stream retries before we give up on the file.
+/// Each retry uses an exponential backoff capped at 16 s.
+const STREAM_MAX_RETRIES: u32 = 8;
+
 /// Download a single file with streaming + sha256, honoring the global PACK_CANCEL flag.
 ///
 /// Supports resume: if a `.part` file already exists, its size is treated as
@@ -98,6 +112,12 @@ async fn sha256_of_file(path: &Path) -> Result<String> {
 /// truncate. The final integrity check re-hashes the assembled `.part` once
 /// the byte stream completes, since we cannot keep an incremental Sha256
 /// state across launcher restarts.
+///
+/// Auto-retry: if the byte stream is severed mid-transfer (e.g. Oracle Object
+/// Storage closes the connection after a few hundred MB), we re-issue the GET
+/// with a fresh `Range:` header pointing at the byte we're up to and keep
+/// going. Bounded by `STREAM_MAX_RETRIES` per file so a truly dead URL still
+/// surfaces as a failure.
 async fn download_one<F>(
     file: &OptionalPackFile,
     dest: &Path,
@@ -108,85 +128,43 @@ where
 {
     let part_path = dest.with_extension("part");
 
-    // Existing partial download? Range-request to resume.
-    let resume_from: u64 = match fs::metadata(&part_path).await {
-        Ok(m) => m.len(),
-        Err(_) => 0,
-    };
-
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|e| InterruptibleFnError::Err(format!("client build: {}", e)))?;
-    let mut req = client.get(&file.url);
-    if resume_from > 0 && resume_from < file.size {
-        req = req.header(reqwest::header::RANGE, format!("bytes={}-", resume_from));
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| InterruptibleFnError::Err(format!("GET {}: {}", file.url, e)))?
-        .error_for_status()
-        .map_err(|e| InterruptibleFnError::Err(format!("HTTP error: {}", e)))?;
-
-    // Did the server honor the range request?
-    let status = resp.status().as_u16();
-    let resuming = resume_from > 0 && resume_from < file.size && status == 206;
-    if resume_from > 0 && !resuming {
-        log::info!("server returned {} not 206; restarting download of {} from byte 0", status, file.name);
-        let _ = fs::remove_file(&part_path).await;
-    }
-
-    let body_len = resp.content_length();
-    let total = if resuming {
-        body_len.map(|c| resume_from + c).unwrap_or(file.size)
-    } else {
-        body_len.unwrap_or(file.size)
-    };
-
-    let mut stream = resp.bytes_stream();
-    let mut out = if resuming {
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&part_path)
-            .await
-            .map_err(|e| InterruptibleFnError::Err(format!("append part: {}", e)))?
-    } else {
-        fs::File::create(&part_path)
-            .await
-            .map_err(|e| InterruptibleFnError::Err(format!("create part: {}", e)))?
-    };
-
-    let mut downloaded: u64 = if resuming { resume_from } else { 0 };
-    let started = Instant::now();
-    let started_bytes = downloaded;
-    let mut last_emit = Instant::now();
-
-    // Emit an initial progress event so the UI immediately reflects the
-    // resume offset (otherwise the bar starts at 0 even when 80% is on disk).
-    on_progress(downloaded, total, 0);
-
-    while let Some(chunk) = stream.next().await {
+    let mut retries: u32 = 0;
+    loop {
         if PACK_CANCEL.load(Ordering::Relaxed) {
-            // Don't delete .part on cancel — leave it for the next resume.
             return Err(InterruptibleFnError::Interrupted);
         }
-        let chunk = chunk.map_err(|e| InterruptibleFnError::Err(format!("recv: {}", e)))?;
-        out.write_all(&chunk)
-            .await
-            .map_err(|e| InterruptibleFnError::Err(format!("write: {}", e)))?;
-        downloaded += chunk.len() as u64;
-
-        if last_emit.elapsed().as_millis() > 250 {
-            let secs = started.elapsed().as_secs_f64().max(0.001);
-            let bps = (((downloaded - started_bytes) as f64) / secs) as u64;
-            on_progress(downloaded, total, bps);
-            last_emit = Instant::now();
+        match stream_to_part(file, &part_path, on_progress).await {
+            StreamOutcome::Done => break,
+            StreamOutcome::Fatal(e) => return Err(e),
+            StreamOutcome::Transient(msg) => {
+                if retries >= STREAM_MAX_RETRIES {
+                    return Err(InterruptibleFnError::Err(format!(
+                        "{} after {} retries: {}",
+                        file.name, retries, msg
+                    )));
+                }
+                let backoff_secs = 1u64 << retries.min(4); // 1, 2, 4, 8, 16, 16, …
+                retries += 1;
+                log::warn!(
+                    "{} stream interrupted ({}); retry {}/{} in {} s",
+                    file.name,
+                    msg,
+                    retries,
+                    STREAM_MAX_RETRIES,
+                    backoff_secs
+                );
+                // Cancel-aware sleep: poll every 250 ms so a user cancel
+                // doesn't wait out the full backoff.
+                let deadline = Instant::now() + std::time::Duration::from_secs(backoff_secs);
+                while Instant::now() < deadline {
+                    if PACK_CANCEL.load(Ordering::Relaxed) {
+                        return Err(InterruptibleFnError::Interrupted);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
         }
     }
-    out.flush()
-        .await
-        .map_err(|e| InterruptibleFnError::Err(format!("flush: {}", e)))?;
-    drop(out);
 
     // Hash the assembled .part. The caller already emits a "Verifying"
     // status before download_one; this call is just the final integrity
@@ -207,6 +185,151 @@ where
         .await
         .map_err(|e| InterruptibleFnError::Err(format!("rename {} -> {}: {}", part_path.display(), dest.display(), e)))?;
     Ok(())
+}
+
+/// One attempt at streaming `file` into `part_path`. Returns `Done` once the
+/// server has finished delivering the body and the part file matches the
+/// expected size, `Transient` if the stream was severed mid-way (caller
+/// should sleep + retry with a fresh Range request), or `Fatal` for anything
+/// that won't benefit from retry (cancel, bad URL, write error).
+async fn stream_to_part<F>(
+    file: &OptionalPackFile,
+    part_path: &Path,
+    on_progress: &mut F,
+) -> StreamOutcome
+where
+    F: FnMut(u64, u64, u64),
+{
+    // Existing partial download? Range-request to resume.
+    let resume_from: u64 = match fs::metadata(part_path).await {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            return StreamOutcome::Fatal(InterruptibleFnError::Err(format!(
+                "client build: {}", e
+            )));
+        }
+    };
+    let mut req = client.get(&file.url);
+    if resume_from > 0 && resume_from < file.size {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", resume_from));
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Failure before any byte arrived. Treat as transient — the
+            // backoff loop will retry. If it's a genuinely bad URL the
+            // retry budget will eventually surface a Fatal.
+            return StreamOutcome::Transient(format!("GET {}: {}", file.url, e));
+        }
+    };
+    let resp = match resp.error_for_status() {
+        Ok(r) => r,
+        Err(e) => {
+            // 4xx/5xx — almost always permanent. Don't burn retries.
+            return StreamOutcome::Fatal(InterruptibleFnError::Err(format!(
+                "HTTP error: {}", e
+            )));
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let resuming = resume_from > 0 && resume_from < file.size && status == 206;
+    if resume_from > 0 && !resuming {
+        log::info!(
+            "server returned {} not 206; restarting download of {} from byte 0",
+            status, file.name
+        );
+        let _ = fs::remove_file(part_path).await;
+    }
+
+    let body_len = resp.content_length();
+    let total = if resuming {
+        body_len.map(|c| resume_from + c).unwrap_or(file.size)
+    } else {
+        body_len.unwrap_or(file.size)
+    };
+
+    let mut stream = resp.bytes_stream();
+    let open_res = if resuming {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(part_path)
+            .await
+    } else {
+        fs::File::create(part_path).await
+    };
+    let mut out = match open_res {
+        Ok(f) => f,
+        Err(e) => {
+            return StreamOutcome::Fatal(InterruptibleFnError::Err(format!(
+                "open part: {}", e
+            )));
+        }
+    };
+
+    let mut downloaded: u64 = if resuming { resume_from } else { 0 };
+    let started = Instant::now();
+    let started_bytes = downloaded;
+    let mut last_emit = Instant::now();
+
+    // Emit an initial progress event so the UI immediately reflects the
+    // resume offset (otherwise the bar starts at 0 even when 80% is on disk).
+    on_progress(downloaded, total, 0);
+
+    while let Some(chunk) = stream.next().await {
+        if PACK_CANCEL.load(Ordering::Relaxed) {
+            // Don't delete .part on cancel — leave it for the next resume.
+            return StreamOutcome::Fatal(InterruptibleFnError::Interrupted);
+        }
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                // Mid-stream disconnect. Flush whatever we have and bubble
+                // up a transient so the retry loop can re-issue with a
+                // fresh Range header.
+                let _ = out.flush().await;
+                return StreamOutcome::Transient(format!("recv: {}", e));
+            }
+        };
+        if let Err(e) = out.write_all(&chunk).await {
+            // Write errors are local — disk full, permissions, etc. No point
+            // retrying with the network.
+            return StreamOutcome::Fatal(InterruptibleFnError::Err(format!(
+                "write: {}", e
+            )));
+        }
+        downloaded += chunk.len() as u64;
+
+        if last_emit.elapsed().as_millis() > 250 {
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            let bps = (((downloaded - started_bytes) as f64) / secs) as u64;
+            on_progress(downloaded, total, bps);
+            last_emit = Instant::now();
+        }
+    }
+    if let Err(e) = out.flush().await {
+        return StreamOutcome::Fatal(InterruptibleFnError::Err(format!("flush: {}", e)));
+    }
+    drop(out);
+
+    // Some servers (notably Oracle) end the stream cleanly even when they
+    // haven't actually delivered the whole body. Treat a short part as a
+    // transient so the retry path picks up where we stopped.
+    if let Ok(meta) = fs::metadata(part_path).await {
+        if meta.len() < file.size {
+            return StreamOutcome::Transient(format!(
+                "short body: got {} of {} bytes",
+                meta.len(),
+                file.size
+            ));
+        }
+    }
+    StreamOutcome::Done
 }
 
 /// Download an entire pack (sequential file downloads). `progress_cb` receives detailed
